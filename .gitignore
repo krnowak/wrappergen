@@ -1,0 +1,4 @@
+*_wrappers.go
+
+/wrappergen
+/tools/golangci-lint
