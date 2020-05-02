@@ -929,12 +929,9 @@ type parametersFull []parameterInfo
 
 func (p parametersFull) String() string {
 	strs := make([]string, 0, len(p))
+	names := StringSet{}
 	for idx, e := range p {
-		// TODO: avoid name conflicts
-		name := e.name
-		if name == "" {
-			name = fmt.Sprintf("param%d", idx)
-		}
+		name := generateName(names, e.name, idx)
 		strs = append(strs, fmt.Sprintf("%s %s", name, e.typeStr))
 	}
 	return strings.Join(strs, ", ")
@@ -944,15 +941,24 @@ type parametersNames []parameterInfo
 
 func (p parametersNames) String() string {
 	strs := make([]string, 0, len(p))
+	names := StringSet{}
 	for idx, e := range p {
-		// TODO: avoid name conflicts
-		name := e.name
-		if name == "" {
-			name = fmt.Sprintf("param%d", idx)
-		}
+		name := generateName(names, e.name, idx)
 		strs = append(strs, name)
 	}
 	return strings.Join(strs, ", ")
+}
+
+func generateName(names StringSet, name string, idx int) string {
+	if name == "" {
+		name = fmt.Sprintf("param%d", idx)
+	}
+	for names.Has(name) {
+		idx *= 10
+		name = fmt.Sprintf("param%d", idx)
+	}
+	names.Add(name)
+	return name
 }
 
 func printImpls(w io.Writer, rt *resolvedTypes, ta *typeAnalysis, prefix string, extraFields []extraField) {
