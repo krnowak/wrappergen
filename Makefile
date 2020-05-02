@@ -1,6 +1,7 @@
 .PHONY: all
 all: tools/golangci-lint
 	go build .
+	go test -run xxxxxMatchNothingxxxxx . >/dev/null
 	./tools/golangci-lint run --fix
 	go mod tidy
 

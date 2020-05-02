@@ -16,15 +16,16 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"go/format"
-	"go/token"
 	"go/types"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -132,283 +133,832 @@ func strToExtraField(s string) (extraField, error) {
 }
 
 type resolvedType struct {
-	at  aType
-	pkg *packages.Package
-	rt  *types.Named
+	at          aType
+	rt          *types.Named
+	origPkgName string // empty for builtin types
+	pkgPath     string // empty for builtin types
+}
+
+type silentFailureType struct{}
+
+var (
+	silentFailure silentFailureType
+	_             error = silentFailure
+)
+
+func (silentFailureType) Error() string {
+	return ""
 }
 
 func main() {
-	inFileStr := flag.String("infile", "", "input file, if empty, GOFILE env var will be consulted")
-	outFileStr := flag.String("outfile", "", "output file, if empty, will be deduced from the base type")
-	baseTypeStr := flag.String("basetype", "", "base type, like driver.Conn")
-	extTypesStr := flag.String("exttypes", "", "semicolon-separated list of extension types, like driver.ConnBeginTx,driver.ConnPrepareContext")
-	extraFieldsStr := flag.String("extrafields", "", "semicolon-separated list of comma-separated pairs of names and types of extra fields, like count,int;rate,double")
-	importsStr := flag.String("imports", "", "semicolon-separated list of imports; imports can be in form of either path (like database/sql/driver) or name,path (like driver,database/sql/driver)")
-	prefix := flag.String("prefix", "", "prefix of the function called by interface implementations, like real (will cause Close method to call realClose function")
-	newFunc := flag.String("newfunc", "", "name of the function creating a wrapper, like newConn")
-	flag.Parse()
+	if err := mainErr(); err != nil {
+		if err != silentFailure {
+			printWithPrefix("ERROR", "%v", err)
+		}
+		os.Exit(1)
+	}
+}
 
-	if *baseTypeStr == "" {
-		fail("no base type (or it is empty), use -basetype to specify it")
+func mainErr() error {
+	flagset := flag.NewFlagSet("wrappergen", flag.ContinueOnError)
+	fi := &flagsInput{}
+	fi.configureFlagSet(flagset)
+	if err := fi.parseFlagsAndEnvironment(flagset, os.Args[1:], os.Environ()); err != nil {
+		return err
 	}
-	if *extTypesStr == "" {
-		fail("no extension types, use -exttypes to specify them")
+	if err := fi.ensureValid(); err != nil {
+		return err
 	}
-	if *prefix == "" {
-		fail("no prefix (or it is empty), use -prefix to specify it")
+	pi := &parsedInput{}
+	if err := pi.parseInput(fi); err != nil {
+		return err
 	}
-	if *newFunc == "" {
-		fail("no new func name (or it is empty), use -newfunc to specify it")
+	fi = nil // we don't need it any more
+	rt := &resolvedTypes{}
+	if err := rt.resolveTypes(pi); err != nil {
+		return err
 	}
-
-	inFile := *inFileStr
-	if inFile == "" {
-		inFile = os.Getenv("GOFILE")
-	}
-	if inFile == "" {
-		fail("no in file, use -infile to specify it or export the GOFILE environment variable")
-	}
-	{
-		absInFile, err := filepath.Abs(inFile)
-		if err != nil {
-			fail("failed to get absolute path of infile %s: %v", inFile, err)
-		}
-		inFile = absInFile
-	}
-	inFileInfo, err := os.Stat(inFile)
-	if err != nil {
-		fail("failed to stat infile %s: %v", inFile, err)
-	}
-	if !inFileInfo.Mode().IsRegular() {
-		fail("infile %s is not a file", inFile)
-	}
-	var baseType aType
-	{
-		var err error
-		baseType, err = strToAType(*baseTypeStr)
-		if err != nil {
-			fail("failed to get a base type: %v", err)
-		}
-	}
-	var extTypes []aType
-	{
-		ets := strings.Split(*extTypesStr, ";")
-		for _, et := range ets {
-			at, err := strToAType(et)
-			if err != nil {
-				fail("failed to get an extension type: %v", err)
-			}
-			extTypes = append(extTypes, at)
-		}
-	}
-	var extraFields []extraField
-	if len(*extraFieldsStr) > 0 {
-		efs := strings.Split(*extraFieldsStr, ";")
-		for _, ef := range efs {
-			aef, err := strToExtraField(ef)
-			if err != nil {
-				fail("failed to get an extra field: %v", err)
-			}
-			extraFields = append(extraFields, aef)
-		}
-	}
-	var imports []anImport
-	if len(*importsStr) > 0 {
-		is := strings.Split(*importsStr, ";")
-		for _, i := range is {
-			ai, err := strToAnImport(i)
-			if err != nil {
-				fail("failed to get an import: %v", err)
-			}
-			imports = append(imports, ai)
-		}
-	}
-	pattern := fmt.Sprintf("file=%s", inFile)
-	fset := token.NewFileSet()
-	cfg := packages.Config{
-		Mode:  packages.NeedName | packages.NeedFiles | packages.NeedImports | packages.NeedDeps | packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo,
-		Fset:  fset,
-		Tests: false,
-	}
-	pkgs, err := packages.Load(&cfg, pattern)
-	if err != nil {
-		fail("failed to load packages with pattern %s: %v", pattern, err)
-	}
-	if len(pkgs) != 1 {
-		fail("loaded %d packages for pattern %s, expected one", len(pkgs), pattern)
-	}
-	thisPkg := pkgs[0]
-	basePkgPath, err := getPkgPath(thisPkg, baseType, inFile, imports)
-	if err != nil {
-		fail("failed to get package path for base type %s: %v (means, the package of the base type is not imported in this package nor mentioned in -imports)", baseType, err)
-	}
-	basePkg, err := findPackage(&cfg, thisPkg, basePkgPath)
-	if err != nil {
-		fail("failed to find package %s for base type %s: %v (means, it isn't imported in this package, nor the go tools loader could load it", basePkgPath, baseType, err)
-	}
-	realBaseType, err := getType(basePkg, baseType.name)
-	if err != nil {
-		fail("failed to resolve the base type %s: %v (means, we could not find the type in the actual package)", baseType, err)
-	}
-	resolvedBaseType := resolvedType{
-		at:  baseType,
-		pkg: basePkg,
-		rt:  realBaseType,
-	}
-	var resolvedExtTypes []resolvedType
-	for _, extType := range extTypes {
-		extPkgPath, err := getPkgPath(thisPkg, extType, inFile, imports)
-		if err != nil {
-			fail("failed to get package path for ext type %s: %v (means, the package of the ext type is not imported in this package nor mentioned in -imports)", extType, err)
-		}
-		extPkg, err := findPackage(&cfg, thisPkg, extPkgPath)
-		if err != nil {
-			fail("failed to find package %s for ext type %s: %v (means, it isn't imported in this package, nor the go tools loader could load it", extPkgPath, extType, err)
-		}
-		realExtType, err := getType(extPkg, extType.name)
-		if err != nil {
-			fail("failed to resolve the ext type %s: %v (means, we could not find the type in the actual package)", extType, err)
-		}
-		resolvedExtType := resolvedType{
-			at:  extType,
-			pkg: extPkg,
-			rt:  realExtType,
-		}
-		resolvedExtTypes = append(resolvedExtTypes, resolvedExtType)
-	}
-	var resolvedEfTypes []resolvedType
-	for _, ef := range extraFields {
-		efPkgPath, err := getPkgPath(thisPkg, ef.atype, inFile, imports)
-		if ef.atype.pkgName == "" {
-			continue
-		}
-		if err != nil {
-			fail("failed to get package path for extra field type %s: %v (means, the package of the extra field type is not imported in this package nor mentioned in -imports)", ef.atype, err)
-		}
-		efPkg, err := findPackage(&cfg, thisPkg, efPkgPath)
-		if err != nil {
-			fail("failed to find package %s for extra field type %s: %v (means, it isn't imported in this package, nor the go tools loader could load it", efPkgPath, ef.atype, err)
-		}
-		realEfType, err := getType(efPkg, ef.atype.name)
-		if err != nil {
-			fail("failed to resolve the extra field type %s: %v (means, we could not find the type in the actual package)", ef.atype, err)
-		}
-		resolvedEfType := resolvedType{
-			at:  ef.atype,
-			pkg: efPkg,
-			rt:  realEfType,
-		}
-		resolvedEfTypes = append(resolvedEfTypes, resolvedEfType)
+	ta := &typeAnalysis{}
+	if err := ta.analyze(rt, pi.imports); err != nil {
+		return err
 	}
 
 	buf := &bytes.Buffer{}
 	fmt.Fprintf(buf, "// Code generated by \"wrappergen %s\"; DO NOT EDIT.\n", strings.Join(os.Args[1:], " "))
 	fmt.Fprintf(buf, "\n")
-	fmt.Fprintf(buf, "package %s\n", thisPkg.Name)
+	fmt.Fprintf(buf, "package %s\n", rt.thisPkgName)
 	fmt.Fprintf(buf, "\n")
-	err = printImports(buf, thisPkg, resolvedBaseType, resolvedExtTypes, resolvedEfTypes, imports)
-	if err != nil {
-		fail("failed to print imports: %v", err)
-	}
+	printImports(buf, ta)
 	fmt.Fprintf(buf, "\n")
-	nComb := printTypes(buf, resolvedBaseType, resolvedExtTypes, extraFields)
+	printTypes(buf, rt, pi.extraFields)
 	fmt.Fprintf(buf, "\n")
-	printVars(buf, resolvedBaseType, resolvedExtTypes)
+	printVars(buf, rt)
 	fmt.Fprintf(buf, "\n")
-	err = printImpls(buf, resolvedBaseType, resolvedExtTypes, *prefix, extraFields)
-	if err != nil {
-		fail("failed to print implementations: %v", err)
-	}
+	printImpls(buf, rt, ta, pi.prefix, pi.extraFields)
 	fmt.Fprintf(buf, "\n")
-	printNewFunc(buf, *newFunc, *prefix, resolvedBaseType, resolvedExtTypes, nComb, extraFields)
+	printNewFunc(buf, pi.newFuncName, pi.prefix, rt, pi.extraFields)
 	src, err := format.Source(buf.Bytes())
 	if err != nil {
 		warn("failed to format the code, compile to see what's wrong: %v", err)
 		src = buf.Bytes()
 	}
-	outFile := *outFileStr
-	if outFile == "" {
-		baseName := fmt.Sprintf("%s_wrappers.go", resolvedBaseType.at.StringNoDot())
-		outFile = filepath.Join(filepath.Dir(inFile), strings.ToLower(baseName))
-	}
-	err = ioutil.WriteFile(outFile, src, 0644)
+	err = ioutil.WriteFile(pi.outFile, src, 0644)
 	if err != nil {
-		fail("failed to write source to outfile %s: %v", outFile, err)
+		return fmt.Errorf("failed to write source to outfile %s: %w", pi.outFile, err)
+	}
+	return nil
+}
+
+type flagsInput struct {
+	inFile      string
+	outFile     string
+	baseType    string
+	extTypes    string
+	extraFields string
+	imports     string
+	prefix      string
+	newFuncName string
+}
+
+func (fi *flagsInput) configureFlagSet(flagset *flag.FlagSet) {
+	flagset.StringVar(&fi.inFile, "infile", "", "input file, if empty, GOFILE env var will be consulted")
+	flagset.StringVar(&fi.outFile, "outfile", "", "output file, if empty, will be deduced from the base type")
+	flagset.StringVar(&fi.baseType, "basetype", "", "base type, like driver.Conn")
+	flagset.StringVar(&fi.extTypes, "exttypes", "", "semicolon-separated list of extension types, like driver.ConnBeginTx,driver.ConnPrepareContext")
+	flagset.StringVar(&fi.extraFields, "extrafields", "", "semicolon-separated list of comma-separated pairs of names and types of extra fields, like count,int;rate,double")
+	flagset.StringVar(&fi.imports, "imports", "", "semicolon-separated list of imports; imports can be in form of either path (like database/sql/driver) or name,path (like driver,database/sql/driver)")
+	flagset.StringVar(&fi.prefix, "prefix", "", "prefix of the function called by interface implementations, like real (will cause Close method to call realClose function")
+	flagset.StringVar(&fi.newFuncName, "newfuncname", "", "name of the function creating a wrapper, like newConn")
+}
+
+func (fi *flagsInput) parseFlagsAndEnvironment(flagset *flag.FlagSet, args, environ []string) error {
+	if err := flagset.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return silentFailure
+		}
+		return err
+	}
+	if fi.inFile == "" {
+		for _, envkv := range environ {
+			if strings.HasPrefix(envkv, "GOFILE=") {
+				fi.inFile = envkv[7:]
+				break
+			}
+		}
+	}
+	return nil
+}
+
+func (fi *flagsInput) ensureValid() error {
+	if fi.baseType == "" {
+		return errors.New("no base type (or it is empty), use -basetype to specify it")
+	}
+	if fi.prefix == "" {
+		return errors.New("no prefix (or it is empty), use -prefix to specify it")
+	}
+	if fi.newFuncName == "" {
+		return errors.New("no new func name (or it is empty), use -newfuncname to specify it")
+	}
+	if fi.inFile == "" {
+		return errors.New("no in file, use -infile to specify it or export the GOFILE environment variable")
+	}
+	inFileInfo, err := os.Stat(fi.inFile)
+	if err != nil {
+		return fmt.Errorf("failed to stat infile %s: %w", fi.inFile, err)
+	}
+	if !inFileInfo.Mode().IsRegular() {
+		return fmt.Errorf("infile %s is not a file", fi.inFile)
+	}
+	return nil
+}
+
+type parsedInput struct {
+	baseType    aType
+	extTypes    []aType
+	extraFields []extraField
+	imports     []anImport
+	inFile      string
+	outFile     string
+	prefix      string
+	newFuncName string
+}
+
+func (pi *parsedInput) parseInput(fi *flagsInput) error {
+	{
+		baseType, err := strToAType(fi.baseType)
+		if err != nil {
+			return fmt.Errorf("failed to get base type from input parameter %s: %w", fi.baseType, err)
+		}
+		pi.baseType = baseType
+	}
+	if fi.extTypes != "" {
+		ets := strings.Split(fi.extTypes, ";")
+		for _, et := range ets {
+			at, err := strToAType(et)
+			if err != nil {
+				return fmt.Errorf("failed to get an extension type from input parameter %s: %w", et, err)
+			}
+			pi.extTypes = append(pi.extTypes, at)
+		}
+	}
+	if fi.extraFields != "" {
+		efs := strings.Split(fi.extraFields, ";")
+		for _, ef := range efs {
+			aef, err := strToExtraField(ef)
+			if err != nil {
+				return fmt.Errorf("failed to get an extra field from input parameter %s: %w", ef, err)
+			}
+			pi.extraFields = append(pi.extraFields, aef)
+		}
+	}
+	if fi.imports != "" {
+		is := strings.Split(fi.imports, ";")
+		for _, i := range is {
+			ai, err := strToAnImport(i)
+			if err != nil {
+				return fmt.Errorf("failed to get an import from input parameter %s: %w", i, err)
+			}
+			pi.imports = append(pi.imports, ai)
+		}
+	}
+	if filepath.IsAbs(fi.inFile) {
+		pi.inFile = fi.inFile
+	} else if absPath, err := filepath.Abs(fi.inFile); err != nil {
+		return fmt.Errorf("failed to get an absolute path of the infile %s: %w", fi.inFile, err)
+	} else {
+		pi.inFile = absPath
+	}
+	if fi.outFile != "" {
+		pi.outFile = fi.outFile
+	} else {
+		baseName := fmt.Sprintf("%s_wrappers.go", pi.baseType.StringNoDot())
+		pi.outFile = filepath.Join(filepath.Dir(pi.inFile), strings.ToLower(baseName))
+	}
+	if !isValidFunctionName(fi.prefix) {
+		return fmt.Errorf("prefix %s is invalid, it should start with either uppercase or lowercase ASCII character or an underline, and then followed by uppercase or lowercase ASCII characters or ASCII digits or underlines", fi.prefix)
+	}
+	pi.prefix = fi.prefix
+	if !isValidFunctionName(fi.newFuncName) {
+		return fmt.Errorf("function name %s is invalid, it should start with either uppercase or lowercase ASCII character or an underline, and then followed by uppercase or lowercase ASCII characters or ASCII digits or underlines", fi.newFuncName)
+	}
+	pi.newFuncName = fi.newFuncName
+	return nil
+}
+
+func isValidFunctionName(s string) bool {
+	if s == "" {
+		return false
+	}
+	if (s[0] < 'A' || s[0] > 'Z') &&
+		(s[0] < 'a' || s[0] > 'z') &&
+		(s[0] != '_') {
+		return false
+	}
+	for idx := 1; idx < len(s); idx++ { // first character was already checked
+		if (s[idx] < 'A' || s[idx] > 'Z') &&
+			(s[idx] < 'a' || s[idx] > 'z') &&
+			(s[idx] < '0' || s[idx] > '9') &&
+			(s[idx] != '_') {
+			return false
+		}
+	}
+	return true
+}
+
+type resolvedTypes struct {
+	thisPkgName      string
+	thisPkgPath      string
+	resolvedBaseType resolvedType
+	resolvedExtTypes []resolvedType
+	resolvedEfTypes  []resolvedType
+}
+
+func (rt *resolvedTypes) resolveTypes(pi *parsedInput) error {
+	pattern := fmt.Sprintf("file=%s", pi.inFile)
+	cfg := packages.Config{
+		Mode: packages.NeedName | packages.NeedImports | packages.NeedDeps | packages.NeedTypes,
+		Logf: debug,
+		// TODO: specify parser function that skips function
+		// bodies
+	}
+	pkgs, err := packages.Load(&cfg, pattern)
+	if err != nil {
+		return fmt.Errorf("failed to load packages with pattern %s: %w", pattern, err)
+	}
+	if len(pkgs) != 1 {
+		return fmt.Errorf("loaded %d packages for pattern %s, expected one", len(pkgs), pattern)
+	}
+	rt.thisPkgName = pkgs[0].Name
+	rt.thisPkgPath = pkgs[0].PkgPath
+	{
+		resType, err := rt.resolveType(&cfg, pkgs[0], pi, pi.baseType)
+		if err != nil {
+			return fmt.Errorf("failed to resolve base type %s: %w", pi.baseType, err)
+		}
+		rt.resolvedBaseType = resType
+	}
+	for _, extType := range pi.extTypes {
+		resType, err := rt.resolveType(&cfg, pkgs[0], pi, extType)
+		if err != nil {
+			return fmt.Errorf("failed to resolve ext type %s: %w", extType, err)
+		}
+		rt.resolvedExtTypes = append(rt.resolvedExtTypes, resType)
+	}
+	for _, ef := range pi.extraFields {
+		if ef.atype.String() == "interface{}" {
+			// resolved extra field types are used only to
+			// get the imports, interface{} needs no
+			// imports, so let's just ignore it.
+			continue
+		}
+		resType, err := rt.resolveType(&cfg, pkgs[0], pi, ef.atype)
+		if err != nil {
+			return fmt.Errorf("failed to resolve extra field type %s: %w", ef.atype, err)
+		}
+		rt.resolvedEfTypes = append(rt.resolvedEfTypes, resType)
+	}
+	return nil
+}
+
+func (rt *resolvedTypes) resolveType(cfg *packages.Config, thisPkg *packages.Package, pi *parsedInput, typeToResolve aType) (resolvedType, error) {
+	nilrt := resolvedType{}
+	pkgPath, err := getPkgPath(thisPkg, typeToResolve, pi.inFile, pi.imports)
+	if err != nil {
+		return nilrt, fmt.Errorf("failed to get package path for type %s: %w (means, the package of the type is not imported in this package nor mentioned in -imports)", typeToResolve, err)
+	}
+	if pkgPath == "" {
+		realType, err := getType(types.Universe, typeToResolve.name)
+		if err != nil {
+			return nilrt, fmt.Errorf("failed to resolve the type %s in Universe: %w (means, we could not find the type in the actual package)", typeToResolve, err)
+		}
+		return resolvedType{
+			at: typeToResolve,
+			rt: realType,
+		}, nil
+	}
+	pkg, err := findPackage(cfg, thisPkg, pkgPath)
+	if err != nil {
+		return nilrt, fmt.Errorf("failed to find package %s for type %s: %w (means, it isn't imported in this package, nor the go tools loader could load it", pkgPath, typeToResolve, err)
+	}
+	realType, err := getType(pkg.Types.Scope(), typeToResolve.name)
+	if err != nil {
+		return nilrt, fmt.Errorf("failed to resolve the type %s in pkg %s: %w (means, we could not find the type in the actual package)", typeToResolve, pkg.Name, err)
+	}
+	return resolvedType{
+		at:          typeToResolve,
+		rt:          realType,
+		origPkgName: pkg.Name,
+		pkgPath:     pkg.PkgPath,
+	}, nil
+}
+
+type pkgPathAndName struct {
+	pkgPath  string
+	typeName string
+}
+
+func (i pkgPathAndName) String() string {
+	if i.pkgPath != "" {
+		return fmt.Sprintf(`"%s".%s`, i.pkgPath, i.typeName)
+	}
+	return i.typeName
+}
+
+type parameterInfo struct {
+	name    string
+	typeStr string
+}
+
+type methodInfo struct {
+	name        string
+	parameters  []parameterInfo
+	returnTypes []string
+}
+
+type interfaceInfo struct {
+	embeddedTypes   []pkgPathAndName
+	explicitMethods []methodInfo
+}
+
+type processedType struct {
+	info  pkgPathAndName
+	iface *types.Interface
+}
+
+type typeAnalysis struct {
+	thisPkgPath string
+	imports     map[string]string                   // pkg path -> pkg name
+	typeInfo    map[string]map[string]interfaceInfo // pkg path -> type name -> interface info
+	typeQueue   []processedType
+}
+
+func (ta *typeAnalysis) analyze(rt *resolvedTypes, imports []anImport) error {
+	ta.thisPkgPath = rt.thisPkgPath
+	ta.imports = make(map[string]string)
+	ta.typeInfo = make(map[string]map[string]interfaceInfo)
+	importsMap := make(map[string]string, len(imports))
+	for _, imprt := range imports {
+		if _, ok := importsMap[imprt.path]; ok {
+			return fmt.Errorf("duplicate entry in input imports for path %s", imprt.path)
+		}
+		importsMap[imprt.path] = imprt.name
+	}
+	if err := ta.analyzeForImports(rt, importsMap); err != nil {
+		return err
+	}
+	if err := ta.analyzeForExtraImportsTypesAndMethods(rt); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (ta *typeAnalysis) analyzeForImports(rt *resolvedTypes, importsMap map[string]string) error {
+	if err := ta.analyzeResolvedTypeForImports(rt.resolvedBaseType, importsMap); err != nil {
+		return err
+	}
+	for _, resType := range rt.resolvedExtTypes {
+		if err := ta.analyzeResolvedTypeForImports(resType, importsMap); err != nil {
+			return err
+		}
+	}
+	for _, resType := range rt.resolvedEfTypes {
+		if err := ta.analyzeResolvedTypeForImports(resType, importsMap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ta *typeAnalysis) analyzeResolvedTypeForImports(resType resolvedType, importsMap map[string]string) error {
+	if resType.pkgPath == "" {
+		return nil // builtin type, nothing to import
+	}
+	if resType.pkgPath == ta.thisPkgPath {
+		// type from this package, nothing to import
+		return nil
+	}
+	overriddenName, ok := ta.imports[resType.pkgPath]
+	if ok {
+		if overriddenName == "" {
+			if resType.origPkgName != resType.at.pkgName {
+				return fmt.Errorf("inconsistent imported package name, package %s is referred as %s and as %s, either fix the name in -imports or -basetype or -exttypes", resType.pkgPath, resType.origPkgName, resType.at.pkgName)
+			}
+		} else if overriddenName != resType.at.pkgName {
+			return fmt.Errorf("inconsistent imported package name, package %s is referred as %s and as %s, either fix the name in -imports or -basetype or -exttypes", resType.pkgPath, overriddenName, resType.at.pkgName)
+		}
+	} else {
+		if resType.origPkgName != resType.at.pkgName {
+			overriddenName = resType.at.pkgName
+			importName, ok := importsMap[resType.pkgPath]
+			if ok {
+				if importName != overriddenName {
+					return fmt.Errorf("inconsistent imported package name, package %s is referred as %s and as %s, either fix the name in -imports or -basetype or -exttypes", resType.pkgPath, overriddenName, importName)
+				}
+			}
+		} else {
+			overriddenName = ""
+			importName, ok := importsMap[resType.pkgPath]
+			if ok {
+				if importName != resType.origPkgName {
+					return fmt.Errorf("inconsistent imported package name, package %s is referred as %s and as %s, either fix the name in -imports or -basetype or -exttypes", resType.pkgPath, resType.origPkgName, importName)
+				}
+			}
+		}
+		ta.imports[resType.pkgPath] = overriddenName
+	}
+	return nil
+}
+
+func (ta *typeAnalysis) analyzeForExtraImportsTypesAndMethods(rt *resolvedTypes) error {
+	if err := ta.analyzeResolvedTypeForExtraImportsTypesAndMethods(rt.resolvedBaseType); err != nil {
+		return err
+	}
+	for _, resType := range rt.resolvedExtTypes {
+		if err := ta.analyzeResolvedTypeForExtraImportsTypesAndMethods(resType); err != nil {
+			return err
+		}
+	}
+	for _, resType := range rt.resolvedEfTypes {
+		if err := ta.analyzeResolvedTypeForExtraImportsTypesAndMethods(resType); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ta *typeAnalysis) analyzeResolvedTypeForExtraImportsTypesAndMethods(resType resolvedType) error {
+	info := pkgPathAndName{
+		pkgPath:  resType.pkgPath,
+		typeName: resType.at.name,
+	}
+	if ta.contains(info) {
+		return nil
+	}
+	underType := resType.rt.Underlying()
+	underIface, ok := underType.(*types.Interface)
+	if !ok {
+		return fmt.Errorf("%s is not an interface", resType.at)
+	}
+	err := ta.analyzeInterface(info, underIface)
+	if err != nil {
+		return fmt.Errorf("failed to analyze resolved type for imports, types and methods %s: %w", resType.at, err)
+	}
+	return nil
+}
+
+func (ta *typeAnalysis) analyzeInterface(info pkgPathAndName, iface *types.Interface) error {
+	ta.addForAnalysis(info, iface)
+	for len(ta.typeQueue) > 0 {
+		pt := ta.typeQueue[0]
+		ta.typeQueue[0] = processedType{}
+		ta.typeQueue = ta.typeQueue[1:]
+		if ta.contains(pt.info) {
+			continue
+		}
+		embeddedTypes, err := ta.analyzeEmbeddedTypes(iface)
+		if err != nil {
+			return err
+		}
+		explicitMethods, err := ta.analyzeExplicitMethods(iface)
+		if err != nil {
+			return err
+		}
+		ta.insert(pt.info, embeddedTypes, explicitMethods)
+	}
+	ta.typeQueue = nil
+	return nil
+}
+
+func (ta *typeAnalysis) insert(info pkgPathAndName, embeddedTypes []pkgPathAndName, explicitMethods []methodInfo) {
+	typeNameToInfos, ok := ta.typeInfo[info.pkgPath]
+	if !ok {
+		typeNameToInfos = make(map[string]interfaceInfo)
+		ta.typeInfo[info.pkgPath] = typeNameToInfos
+	}
+	typeNameToInfos[info.typeName] = interfaceInfo{
+		embeddedTypes:   embeddedTypes,
+		explicitMethods: explicitMethods,
 	}
 }
 
-func printNewFunc(w io.Writer, funcName, prefix string, resolvedBaseType resolvedType, resolvedExtTypes []resolvedType, nComb int, extraFields []extraField) {
-	varName := fmt.Sprintf("%s%s", prefix, resolvedBaseType.at.name)
-	en := resolvedBaseType.at.StringNoDot()
+func (ta *typeAnalysis) analyzeEmbeddedTypes(iface *types.Interface) ([]pkgPathAndName, error) {
+	infos := make([]pkgPathAndName, 0, iface.NumEmbeddeds())
+	for idx := 0; idx < iface.NumEmbeddeds(); idx++ {
+		et := iface.EmbeddedType(idx)
+		named, ok := et.(*types.Named)
+		if !ok {
+			return nil, fmt.Errorf("embedded type %s is not an named type (%#v)", et, et)
+		}
+		obj := named.Obj()
+		eat := aType{
+			pkgName: "",
+			name:    obj.Name(),
+		}
+		pkgPath := ""
+		if pkg := obj.Pkg(); pkg != nil {
+			pkgPath = pkg.Path()
+			if name, ok := ta.imports[pkgPath]; ok {
+				if name != "" {
+					eat.pkgName = name
+				}
+			} else {
+				ta.imports[pkgPath] = ""
+			}
+			if eat.pkgName == "" {
+				eat.pkgName = pkg.Name()
+			}
+		}
+		info := pkgPathAndName{
+			pkgPath:  pkgPath,
+			typeName: eat.name,
+		}
+		infos = append(infos, info)
+		if ta.contains(info) {
+			continue
+		}
+		underType := named.Underlying()
+		underIface, ok := underType.(*types.Interface)
+		if !ok {
+			return nil, fmt.Errorf("embedded type %s is not a named interface type (%#v)", eat, underType)
+		}
+		ta.addForAnalysis(info, underIface)
+	}
+	return infos, nil
+}
+
+func (ta *typeAnalysis) addForAnalysis(info pkgPathAndName, iface *types.Interface) {
+	ta.typeQueue = append(ta.typeQueue, processedType{
+		info:  info,
+		iface: iface,
+	})
+}
+
+func (ta *typeAnalysis) contains(info pkgPathAndName) bool {
+	if typeNameToInfos, ok := ta.typeInfo[info.pkgPath]; ok {
+		if _, ok := typeNameToInfos[info.typeName]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (ta *typeAnalysis) get(info pkgPathAndName) (interfaceInfo, bool) {
+	typeNameToInfos, ok := ta.typeInfo[info.pkgPath]
+	if !ok {
+		return interfaceInfo{}, false
+	}
+	ifaceInfo, ok := typeNameToInfos[info.typeName]
+	return ifaceInfo, ok
+}
+
+func (ta *typeAnalysis) mustGet(info pkgPathAndName) interfaceInfo {
+	ifaceInfo, ok := ta.get(info)
+	if !ok {
+		bug("no interface info for %s", info)
+	}
+	return ifaceInfo
+}
+
+func (ta *typeAnalysis) analyzeExplicitMethods(iface *types.Interface) ([]methodInfo, error) {
+	infos := make([]methodInfo, 0, iface.NumExplicitMethods())
+	for idx := 0; idx < iface.NumExplicitMethods(); idx++ {
+		m := iface.ExplicitMethod(idx)
+		sig, ok := m.Type().(*types.Signature)
+		if !ok {
+			return nil, fmt.Errorf("function %s has no signature", m.Name())
+		}
+		params, err := ta.tupleToParameters(sig.Params())
+		if err != nil {
+			return nil, err
+		}
+		results, err := ta.tupleToTypes(sig.Results())
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, methodInfo{
+			name:        m.Name(),
+			parameters:  params,
+			returnTypes: results,
+		})
+	}
+	return infos, nil
+}
+
+func (ta *typeAnalysis) tupleToTypes(tuple *types.Tuple) ([]string, error) {
+	types := make([]string, 0, tuple.Len())
+	for idx := 0; idx < tuple.Len(); idx++ {
+		str, err := ta.typeToStr(tuple.At(idx).Type())
+		if err != nil {
+			return nil, err
+		}
+		types = append(types, str)
+	}
+	return types, nil
+}
+
+func (ta *typeAnalysis) typeToStr(vType types.Type) (string, error) {
+	switch vRealType := vType.(type) {
+	case *types.Basic:
+		return vRealType.Name(), nil
+	case *types.Pointer:
+		elemStr, err := ta.typeToStr(vRealType.Elem())
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("*%s", elemStr), nil
+	case *types.Array:
+		elemStr, err := ta.typeToStr(vRealType.Elem())
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("[%d]%s", vRealType.Len(), elemStr), nil
+	case *types.Slice:
+		elemStr, err := ta.typeToStr(vRealType.Elem())
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("[]%s", elemStr), nil
+	case *types.Map:
+		keyStr, err := ta.typeToStr(vRealType.Key())
+		if err != nil {
+			return "", err
+		}
+		elemStr, err := ta.typeToStr(vRealType.Elem())
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("map[%s]%s", keyStr, elemStr), nil
+	case *types.Chan:
+		elemStr, err := ta.typeToStr(vRealType.Elem())
+		if err != nil {
+			return "", nil
+		}
+		switch vRealType.Dir() {
+		case types.SendRecv:
+			if c, ok := vRealType.Elem().(*types.Chan); ok && c.Dir() == types.RecvOnly {
+				return fmt.Sprintf("chan (%s)", elemStr), nil
+			}
+			return fmt.Sprintf("chan %s", elemStr), nil
+		case types.RecvOnly:
+			return fmt.Sprintf("<-chan %s", elemStr), nil
+		case types.SendOnly:
+			return fmt.Sprintf("chan<- %s", elemStr), nil
+		}
+		return "", fmt.Errorf("invalid channel direction %v", vRealType.Dir())
+	case *types.Struct:
+		return "", errors.New("bare struct types are not supported")
+	case *types.Tuple:
+		return "", errors.New("tuple types are not supported")
+	case *types.Signature:
+		params, err := ta.paramTupleToTypesString(vRealType.Params(), vRealType.Variadic())
+		if err != nil {
+			return "", err
+		}
+		retvals, err := ta.retvalTupleToTypesString(vRealType.Results())
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("func %s %s", params, retvals), nil
+	case *types.Named:
+		vNamedTypeObj := vRealType.Obj()
+		vName := vNamedTypeObj.Name()
+		vPkg := vNamedTypeObj.Pkg()
+		if vPkg == nil {
+			return vName, nil
+		}
+		vPkgPath := vPkg.Path()
+		if vPkgPath == ta.thisPkgPath {
+			return vName, nil
+		}
+		vPkgName := vPkg.Name()
+		if name, ok := ta.imports[vPkgPath]; ok {
+			if name != "" {
+				vPkgName = name
+			}
+		} else {
+			ta.imports[vPkgPath] = ""
+		}
+		return fmt.Sprintf("%s.%s", vPkgName, vName), nil
+	case *types.Interface:
+		// TODO: check if this gets triggered for interface{}
+		// parameters
+		return "", errors.New("bare interface types are not supported")
+	}
+	return "", fmt.Errorf("unknown type %#v", vType)
+}
+
+func (ta *typeAnalysis) paramTupleToTypesString(tuple *types.Tuple, variadic bool) (string, error) {
+	types := make([]string, 0, tuple.Len())
+	for idx := 0; idx < tuple.Len(); idx++ {
+		str, err := ta.typeToStr(tuple.At(idx).Type())
+		if err != nil {
+			return "", err
+		}
+		types = append(types, str)
+	}
+	if variadic {
+		types[tuple.Len()-1] = fmt.Sprintf("...%s", types[tuple.Len()-1])
+	}
+	joined := strings.Join(types, ", ")
+	return fmt.Sprintf("(%s)", joined), nil
+}
+
+func (ta *typeAnalysis) retvalTupleToTypesString(tuple *types.Tuple) (string, error) {
+	types, err := ta.tupleToTypes(tuple)
+	if err != nil {
+		return "", err
+	}
+	if len(types) == 1 {
+		return types[0], nil
+	}
+	joined := strings.Join(types, ", ")
+	return fmt.Sprintf("(%s)", joined), nil
+}
+
+func (ta *typeAnalysis) tupleToParameters(t *types.Tuple) ([]parameterInfo, error) {
+	if t == nil || t.Len() == 0 {
+		return nil, nil
+	}
+	var params []parameterInfo
+	for idx := 0; idx < t.Len(); idx++ {
+		v := t.At(idx)
+		vName := v.Name()
+		vType := v.Type()
+		vTypeStr, err := ta.typeToStr(vType)
+		if err != nil {
+			return nil, fmt.Errorf("could not handle parameter %s: %w", vName, err)
+		}
+		params = append(params, parameterInfo{
+			name:    vName,
+			typeStr: vTypeStr,
+		})
+	}
+	return params, nil
+}
+
+func printNewFunc(w io.Writer, funcName, prefix string, rt *resolvedTypes, extraFields []extraField) {
+	varName := fmt.Sprintf("%s%s", prefix, rt.resolvedBaseType.at.name)
+	en := rt.resolvedBaseType.at.StringNoDot()
 	// exclude the zero - it will be handled after the switch
-	fmt.Fprintf(w, "func %s(%s %s", funcName, varName, resolvedBaseType.at)
+	fmt.Fprintf(w, "func %s(%s %s", funcName, varName, rt.resolvedBaseType.at)
 	for _, ef := range extraFields {
 		fmt.Fprintf(w, ", %s %s", ef.name, ef.atype)
 	}
-	fmt.Fprintf(w, ") %s {\n\tswitch r := %s.(type) {\n", resolvedBaseType.at, varName)
-	for counter := nComb - 1; counter > 0; counter-- {
-		tbn := fmt.Sprintf("%s%d", en, counter)
-		fmt.Fprintf(w, "\tcase i%s:\n\t\treturn &t%s{\n\t\t\tr: r,\n", tbn, tbn)
-		for _, ef := range extraFields {
-			fmt.Fprintf(w, "\t\t\t%s: %s,\n", ef.name, ef.name)
+	fmt.Fprintf(w, ") %s {\n", rt.resolvedBaseType.at)
+	nComb := NCombs(len(rt.resolvedExtTypes))
+	if nComb > 1 {
+		fmt.Fprintf(w, "\tswitch r := %s.(type) {\n", varName)
+		for counter := nComb - 1; counter > 0; counter-- {
+			tbn := fmt.Sprintf("%s%d", en, counter)
+			fmt.Fprintf(w, "\tcase i%s:\n\t\treturn &t%s{\n\t\t\tr: r,\n", tbn, tbn)
+			for _, ef := range extraFields {
+				fmt.Fprintf(w, "\t\t\t%s: %s,\n", ef.name, ef.name)
+			}
+			fmt.Fprintf(w, "\t\t}\n")
 		}
-		fmt.Fprintf(w, "\t\t}\n")
+		fmt.Fprintf(w, "\t}\n")
 	}
-	fmt.Fprintf(w, "\t}\nreturn &t%s0{\n\t\tr: %s,\n", en, varName)
+	fmt.Fprintf(w, "\treturn &t%s0{\n\t\tr: %s,\n", en, varName)
 	for _, ef := range extraFields {
 		fmt.Fprintf(w, "\t\t%s: %s,\n", ef.name, ef.name)
 	}
 	fmt.Fprintf(w, "\t}\n}\n")
 }
 
-type parameter struct {
-	name    string
-	typeStr string
-}
-
-type parametersFull []parameter
+type parametersFull []parameterInfo
 
 func (p parametersFull) String() string {
-	if len(p) == 0 {
-		return ""
-	}
 	strs := make([]string, 0, len(p))
-	for _, e := range p {
-		strs = append(strs, fmt.Sprintf("%s %s", e.name, e.typeStr))
+	for idx, e := range p {
+		// TODO: avoid name conflicts
+		name := e.name
+		if name == "" {
+			name = fmt.Sprintf("param%d", idx)
+		}
+		strs = append(strs, fmt.Sprintf("%s %s", name, e.typeStr))
 	}
 	return strings.Join(strs, ", ")
 }
 
-type parametersNames []parameter
+type parametersNames []parameterInfo
 
 func (p parametersNames) String() string {
-	if len(p) == 0 {
-		return ""
-	}
 	strs := make([]string, 0, len(p))
-	for _, e := range p {
-		strs = append(strs, e.name)
+	for idx, e := range p {
+		// TODO: avoid name conflicts
+		name := e.name
+		if name == "" {
+			name = fmt.Sprintf("param%d", idx)
+		}
+		strs = append(strs, name)
 	}
 	return strings.Join(strs, ", ")
 }
 
-type parametersTypes []parameter
-
-func (p parametersTypes) String() string {
-	if len(p) == 0 {
-		return ""
-	}
-	strs := make([]string, 0, len(p))
-	for _, e := range p {
-		strs = append(strs, e.typeStr)
-	}
-	return strings.Join(strs, ", ")
-}
-
-func printImpls(w io.Writer, resolvedBaseType resolvedType, resolvedExtTypes []resolvedType, prefix string, extraFields []extraField) error {
-	comb := newCombinator(len(resolvedExtTypes))
+func printImpls(w io.Writer, rt *resolvedTypes, ta *typeAnalysis, prefix string, extraFields []extraField) {
+	comb := NewCombGen(len(rt.resolvedExtTypes))
 	counter := 0
-	en := resolvedBaseType.at.StringNoDot()
+	en := rt.resolvedBaseType.at.StringNoDot()
 	first := true
 	for comb.Next() {
 		idxs := comb.Get()
@@ -418,261 +968,105 @@ func printImpls(w io.Writer, resolvedBaseType resolvedType, resolvedExtTypes []r
 		} else {
 			fmt.Fprintf(w, "\n")
 		}
-		handled, err := printImplsFromResolvedType(w, resolvedBaseType, tbn, prefix, extraFields, nil)
-		if err != nil {
-			return err
-		}
+		handled := printImplsFromResolvedType(w, rt.resolvedBaseType, ta, tbn, prefix, extraFields, nil)
 		for _, idx := range idxs {
-			handled, err = printImplsFromResolvedType(w, resolvedExtTypes[idx], tbn, prefix, extraFields, handled)
-			if err != nil {
-				return err
-			}
+			handled = printImplsFromResolvedType(w, rt.resolvedExtTypes[idx], ta, tbn, prefix, extraFields, handled)
 		}
 		counter++
 	}
-	return nil
 }
 
-type stringSet map[string]struct{}
-
-func (s stringSet) Add(str string) {
-	s[str] = struct{}{}
-}
-
-func (s stringSet) AddSet(other stringSet) {
-	for str := range other {
-		s.Add(str)
-	}
-}
-
-func (s stringSet) Has(str string) bool {
-	_, ok := s[str]
-	return ok
-}
-
-func printExplicitImplsOfInterface(w io.Writer, iface *types.Interface, tbn, prefix string, extraFields []extraField) error {
-	for idx := 0; idx < iface.NumExplicitMethods(); idx++ {
-		m := iface.ExplicitMethod(idx)
-		sig, ok := m.Type().(*types.Signature)
-		if !ok {
-			return fmt.Errorf("function %s has no signature", m.Name())
-		}
-		params, err := tupleToParameters(sig.Params())
-		if err != nil {
-			return err
-		}
-		results, err := tupleToParameters(sig.Results())
-		if err != nil {
-			return err
-		}
-		fmt.Fprintf(w, "func (o%s *t%s) %s(%s)", tbn, tbn, m.Name(), (parametersFull)(params))
-		switch len(results) {
+func printExplicitImplsOfInterface(w io.Writer, info pkgPathAndName, ta *typeAnalysis, tbn, prefix string, extraFields []extraField) {
+	ifaceInfo := ta.mustGet(info)
+	for _, mi := range ifaceInfo.explicitMethods {
+		fmt.Fprintf(w, "func (o%s *t%s) %s(%s)", tbn, tbn, mi.name, (parametersFull)(mi.parameters))
+		switch len(mi.returnTypes) {
 		case 0:
 			// nothing to print
 		case 1:
-			fmt.Fprintf(w, " %s", (parametersTypes)(results))
+			fmt.Fprintf(w, " %s", mi.returnTypes[0])
 		default:
-			fmt.Fprintf(w, " (%s)", (parametersTypes)(results))
+			fmt.Fprintf(w, " (%s)", strings.Join(mi.returnTypes, ", "))
 		}
 		fmt.Fprintf(w, " {\n\t")
-		if len(results) > 0 {
+		if len(mi.returnTypes) > 0 {
 			fmt.Fprintf(w, "return ")
 		}
-		fmt.Fprintf(w, "%s%s(o%s.r", prefix, m.Name(), tbn)
+		fmt.Fprintf(w, "%s%s(o%s.r", prefix, mi.name, tbn)
 		for _, ef := range extraFields {
 			fmt.Fprintf(w, ", o%s.%s", tbn, ef.name)
 		}
-		if len(params) > 0 {
-			fmt.Fprintf(w, ", %s", (parametersNames)(params))
+		if len(mi.parameters) > 0 {
+			fmt.Fprintf(w, ", %s", (parametersNames)(mi.parameters))
 		}
 		fmt.Fprintf(w, ")\n}\n")
 	}
-	return nil
 }
 
-func printImplsOfEmbeddedTypes(w io.Writer, iface *types.Interface, excludes stringSet, tbn, prefix string, extraFields []extraField) (stringSet, error) {
-	newExcludes := stringSet{}
-	for idx := 0; idx < iface.NumEmbeddeds(); idx++ {
-		et := iface.EmbeddedType(idx)
-		named, ok := et.(*types.Named)
-		if !ok {
-			return nil, fmt.Errorf("embedded type %s is not an named type (%#v)", et, et)
-		}
-		obj := named.Obj()
-		if excludes.Has(obj.Id()) {
+func printImplsOfEmbeddedTypes(w io.Writer, info pkgPathAndName, ta *typeAnalysis, excludes StringSet, tbn, prefix string, extraFields []extraField) StringSet {
+	newExcludes := StringSet{}
+	ifaceInfo := ta.mustGet(info)
+	for _, eti := range ifaceInfo.embeddedTypes {
+		etiStr := eti.String()
+		if excludes.Has(etiStr) {
 			continue
 		}
-		newExcludes.Add(obj.Id())
-		underType := named.Underlying()
-		underIface, ok := underType.(*types.Interface)
-		if !ok {
-			return nil, fmt.Errorf("embedded type %s is not a named interface type (%#v)", obj.Name(), underType)
-		}
-		subExcludes, err := printImplsFromInterfaceRecursive(w, underIface, newExcludes, tbn, prefix, extraFields)
-		if err != nil {
-			return nil, fmt.Errorf("failed to print impls of embedded named interface %s: %w", obj.Name(), err)
-		}
+		newExcludes.Add(etiStr)
+		subExcludes := printImplsFromInterfaceRecursive(w, eti, ta, newExcludes, tbn, prefix, extraFields)
 		newExcludes.AddSet(subExcludes)
 	}
-	return newExcludes, nil
+	return newExcludes
 }
 
-func printImplsFromInterfaceRecursive(w io.Writer, iface *types.Interface, excludes stringSet, tbn, prefix string, extraFields []extraField) (stringSet, error) {
-	subExcludes, err := printImplsOfEmbeddedTypes(w, iface, excludes, tbn, prefix, extraFields)
-	if err != nil {
-		return nil, err
-	}
-	err = printExplicitImplsOfInterface(w, iface, tbn, prefix, extraFields)
-	if err != nil {
-		return nil, err
-	}
-	newExcludes := stringSet{}
+func printImplsFromInterfaceRecursive(w io.Writer, info pkgPathAndName, ta *typeAnalysis, excludes StringSet, tbn, prefix string, extraFields []extraField) StringSet {
+	subExcludes := printImplsOfEmbeddedTypes(w, info, ta, excludes, tbn, prefix, extraFields)
+	printExplicitImplsOfInterface(w, info, ta, tbn, prefix, extraFields)
+	newExcludes := StringSet{}
 	newExcludes.AddSet(excludes)
 	newExcludes.AddSet(subExcludes)
-	return newExcludes, nil
+	return newExcludes
 }
 
-func printImplsFromResolvedType(w io.Writer, resType resolvedType, tbn, prefix string, extraFields []extraField, excludes stringSet) (stringSet, error) {
-	underType := resType.rt.Underlying()
-	underIface, ok := underType.(*types.Interface)
-	if !ok {
-		return nil, fmt.Errorf("%s is not an interface", resType.at)
+func printImplsFromResolvedType(w io.Writer, resType resolvedType, ta *typeAnalysis, tbn, prefix string, extraFields []extraField, excludes StringSet) StringSet {
+	info := pkgPathAndName{
+		pkgPath:  resType.pkgPath,
+		typeName: resType.at.name,
 	}
-	newExcludes := stringSet{}
+	newExcludes := StringSet{}
 	newExcludes.AddSet(excludes)
-	newExcludes.Add(resType.rt.Obj().Id())
-	subExcludes, err := printImplsFromInterfaceRecursive(w, underIface, newExcludes, tbn, prefix, extraFields)
-	if err != nil {
-		return nil, fmt.Errorf("failed to print impls for interface %s: %w", resType.at, err)
-	}
-	return subExcludes, nil
+	newExcludes.Add(info.String())
+	subExcludes := printImplsFromInterfaceRecursive(w, info, ta, newExcludes, tbn, prefix, extraFields)
+	return subExcludes
 }
 
-func typeToStr(vType types.Type) string {
-	switch vRealType := vType.(type) {
-	case *types.Named:
-		vNamedTypeObj := vRealType.Obj()
-		vPkg := vNamedTypeObj.Pkg()
-		if vPkg != nil {
-			return fmt.Sprintf("%s.%s", vPkg.Name(), vNamedTypeObj.Name())
-		}
-		return vNamedTypeObj.Name()
-	case *types.Basic:
-		return vRealType.Name()
-	case *types.Slice:
-		elemStr := typeToStr(vRealType.Elem())
-		if elemStr == "" {
-			return ""
-		}
-		return fmt.Sprintf("[]%s", elemStr)
-	case *types.Pointer:
-		elemStr := typeToStr(vRealType.Elem())
-		if elemStr == "" {
-			return ""
-		}
-		return fmt.Sprintf("*%s", elemStr)
-	default:
-		return ""
-	}
-}
-
-func tupleToParameters(t *types.Tuple) ([]parameter, error) {
-	if t == nil || t.Len() == 0 {
-		return nil, nil
-	}
-	var simpleParams []parameter
-	for idx := 0; idx < t.Len(); idx++ {
-		v := t.At(idx)
-		vName := v.Name()
-		if vName == "" {
-			vName = fmt.Sprintf("param%d", idx)
-		}
-		vType := v.Type()
-		vTypeStr := typeToStr(vType)
-		if vTypeStr == "" {
-			debug("parameter %s is %s (%#v)", vName, vType, vType)
-			return nil, fmt.Errorf("could not handle parameter %s (%T)", vName, vType)
-		}
-		simpleParams = append(simpleParams, parameter{
-			name:    vName,
-			typeStr: vTypeStr,
-		})
-	}
-	return simpleParams, nil
-}
-
-func printVars(w io.Writer, resolvedBaseType resolvedType, resolvedExtTypes []resolvedType) {
+func printVars(w io.Writer, rt *resolvedTypes) {
 	fmt.Fprintf(w, "var (\n")
 	counter := 0
-	en := resolvedBaseType.at.StringNoDot()
-	comb := newCombinator(len(resolvedExtTypes))
+	en := rt.resolvedBaseType.at.StringNoDot()
+	comb := NewCombGen(len(rt.resolvedExtTypes))
 	for comb.Next() {
 		idxs := comb.Get()
 		tbn := fmt.Sprintf("%s%d", en, counter)
-		fmt.Fprintf(w, "\t_ %s = &t%s{}\n", resolvedBaseType.at, tbn)
+		fmt.Fprintf(w, "\t_ %s = &t%s{}\n", rt.resolvedBaseType.at, tbn)
 		for _, idx := range idxs {
-			fmt.Fprintf(w, "\t_ %s = &t%s{}\n", resolvedExtTypes[idx].at, tbn)
+			fmt.Fprintf(w, "\t_ %s = &t%s{}\n", rt.resolvedExtTypes[idx].at, tbn)
 		}
 		counter++
 	}
 	fmt.Fprintf(w, ")\n")
 }
 
-type combinator struct {
-	n   int
-	idx []int
-}
-
-func newCombinator(n int) *combinator {
-	return &combinator{
-		n:   n,
-		idx: nil,
-	}
-}
-
-func (c *combinator) Next() bool {
-	if len(c.idx) > c.n {
-		return false
-	}
-	if c.idx == nil {
-		c.idx = []int{}
-		return true
-	}
-	i := len(c.idx) - 1
-	l := c.n - 1
-	for i >= 0 {
-		if c.idx[i] < l {
-			c.idx[i]++
-			return true
-		}
-		i--
-		l--
-	}
-	c.idx = append(c.idx, 0)
-	if len(c.idx) > c.n {
-		return false
-	}
-	for i := range c.idx {
-		c.idx[i] = i
-	}
-	return true
-}
-
-func (c *combinator) Get() []int {
-	return c.idx
-}
-
-func printTypes(w io.Writer, resolvedBaseType resolvedType, resolvedExtTypes []resolvedType, extraFields []extraField) int {
+func printTypes(w io.Writer, rt *resolvedTypes, extraFields []extraField) {
 	fmt.Fprintf(w, "type (\n")
 	counter := 0
-	en := resolvedBaseType.at.StringNoDot()
-	comb := newCombinator(len(resolvedExtTypes))
+	en := rt.resolvedBaseType.at.StringNoDot()
+	comb := NewCombGen(len(rt.resolvedExtTypes))
 	for comb.Next() {
 		idxs := comb.Get()
 		tbn := fmt.Sprintf("%s%d", en, counter)
-		fmt.Fprintf(w, "\n\ti%s interface {\n\t\t%s\n", tbn, resolvedBaseType.at)
+		fmt.Fprintf(w, "\n\ti%s interface {\n\t\t%s\n", tbn, rt.resolvedBaseType.at)
 		for _, idx := range idxs {
-			fmt.Fprintf(w, "\t\t%s\n", resolvedExtTypes[idx].at)
+			fmt.Fprintf(w, "\t\t%s\n", rt.resolvedExtTypes[idx].at)
 		}
 		fmt.Fprintf(w, "\t}\n\n\tt%s struct {\n\t\tr i%s\n", tbn, tbn)
 		for _, ef := range extraFields {
@@ -682,81 +1076,37 @@ func printTypes(w io.Writer, resolvedBaseType resolvedType, resolvedExtTypes []r
 		counter++
 	}
 	fmt.Fprintf(w, ")\n")
-	return counter
 }
 
-func printImports(w io.Writer, thisPkg *packages.Package, resolvedBaseType resolvedType, resolvedExtTypes, resolvedEfTypes []resolvedType, imports []anImport) error {
-	type namedPkg struct {
-		pkg  *packages.Package
-		name string
+func printImports(w io.Writer, ta *typeAnalysis) {
+	sortedImports := make([]string, 0, len(ta.imports))
+	for pkgPath := range ta.imports {
+		sortedImports = append(sortedImports, pkgPath)
 	}
-	dedupPackages := map[string]namedPkg{}
-	allResolvedTypes := make([]resolvedType, 0, 1+len(resolvedExtTypes)+len(resolvedEfTypes))
-	allResolvedTypes = append(allResolvedTypes, resolvedBaseType)
-	allResolvedTypes = append(allResolvedTypes, resolvedExtTypes...)
-	allResolvedTypes = append(allResolvedTypes, resolvedEfTypes...)
-	for _, ret := range allResolvedTypes {
-		np, ok := dedupPackages[ret.pkg.ID]
-		if ok {
-			if np.name == "" || np.name == ret.at.pkgName {
-				continue
-			}
-			if ret.pkg.Name != ret.at.pkgName {
-				return fmt.Errorf("inconsistent imported package name, package %s is referred as %s and as %s, either fix the name in -imports or -basetype or in infile's imports", ret.pkg.Name, np.name, ret.at.pkgName)
-			}
-			np.name = ""
-		} else {
-			np.pkg = ret.pkg
-			if resolvedBaseType.pkg.Name != resolvedBaseType.at.pkgName {
-				np.name = resolvedBaseType.at.pkgName
-			} else {
-				np.name = ""
-			}
-		}
-		dedupPackages[ret.pkg.ID] = np
-	}
-
+	sort.Strings(sortedImports)
 	fmt.Fprintf(w, "import (\n")
-	for _, imprt := range imports {
-		if imprt.name != "" {
-			fmt.Fprintf(w, "\t%s %q\n", imprt.name, imprt.path)
-		} else {
-			fmt.Fprintf(w, "\t%q\n", imprt.path)
+
+	for _, pkgPath := range sortedImports {
+		name, ok := ta.imports[pkgPath]
+		if !ok {
+			bug("corrupted imports, %#v and %#v", sortedImports, ta.imports)
 		}
-	}
-	for id, np := range dedupPackages {
-		if id == thisPkg.ID {
-			continue
-		}
-		if np.name != "" {
-			fmt.Fprintf(w, "\t%s %q\n", np.name, np.pkg.PkgPath)
+		if name != "" {
+			fmt.Fprintf(w, "\t%s %q\n", name, pkgPath)
 		} else {
-			fmt.Fprintf(w, "\t%q\n", np.pkg.PkgPath)
+			fmt.Fprintf(w, "\t%q\n", pkgPath)
 		}
 	}
 	fmt.Fprintf(w, ")\n")
-	return nil
 }
 
 func getPkgPath(thisPkg *packages.Package, at aType, inFile string, imports []anImport) (string, error) {
+	if at.pkgName == "" {
+		return "", nil
+	}
 	for _, imprt := range imports {
 		if imprt.name == at.pkgName {
 			return imprt.path, nil
-		}
-	}
-	idx := -1
-	for i, path := range thisPkg.CompiledGoFiles {
-		if path == inFile {
-			idx = i
-			break
-		}
-	}
-	if idx >= 0 && len(thisPkg.Syntax) > idx {
-		f := thisPkg.Syntax[idx]
-		for _, imprt := range f.Imports {
-			if imprt.Name != nil && imprt.Name.Name == at.pkgName {
-				return imprt.Path.Value, nil
-			}
 		}
 	}
 	for path, ipkg := range thisPkg.Imports {
@@ -798,33 +1148,26 @@ func findPackageNoLoad(fpkg *packages.Package, pkgPath string) *packages.Package
 	return nil
 }
 
-func getType(pkg *packages.Package, name string) (*types.Named, error) {
-	debug("searching for type %s in package %s (%s)", name, pkg.Name, pkg.PkgPath)
-	obj := pkg.Types.Scope().Lookup(name)
+func getType(scope *types.Scope, name string) (*types.Named, error) {
+	obj := scope.Lookup(name)
 	if obj != nil {
 		named, ok := obj.Type().(*types.Named)
 		if ok {
-			debug("found a type through lookup: %s", named)
 			return named, nil
 		}
+		return nil, fmt.Errorf("type %s is not a named type", name)
 	}
-	return nil, fmt.Errorf("no type %s in pkg %s", name, pkg.Name)
+	return nil, fmt.Errorf("no type %s", name)
 }
 
-func fail(formatStr string, args ...interface{}) {
-	printWithPrefix("ERROR", formatStr, args...)
-	os.Exit(1)
+func bug(formatStr string, args ...interface{}) {
+	printWithPrefix("BUG", formatStr, args...)
+	os.Exit(2)
 }
 
 func warn(formatStr string, args ...interface{}) {
 	printWithPrefix("WARN", formatStr, args...)
 }
-
-/*
-func info(formatStr string, args ...interface{}) {
-	printWithPrefix("INFO", formatStr, args...)
-}
-*/
 
 func debug(formatStr string, args ...interface{}) {
 	if !isDbg {

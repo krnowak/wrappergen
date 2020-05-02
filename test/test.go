@@ -7,15 +7,41 @@ import (
 	"database/sql/driver"
 )
 
-//go:generate wrappergen -basetype=driver.Conn -exttypes=driver.ConnBeginTx;driver.ConnPrepareContext;driver.Execer;driver.ExecerContext;driver.NamedValueChecker;driver.Pinger;driver.Queryer;driver.QueryerContext;driver.SessionResetter -extrafields=extra,interface{} -prefix=real -newfunc=newConn -imports=context
+//go:generate wrappergen -basetype=driver.Driver -exttypes=driver.DriverContext -extrafields=extra,interface{} -prefix=realDD -newfuncname=newDriver
 
-//go:generate wrappergen -basetype=driver.Stmt -exttypes=driver.ColumnConverter;driver.NamedValueChecker;driver.StmtExecContext;driver.StmtQueryContext -extrafields=extra,interface{} -prefix=realDS -newfunc=newStmt -imports=context
+//go:generate wrappergen -basetype=driver.Connector -prefix=realDCC -newfuncname=newConnector -extrafields extra,interface{}
 
-//go:generate wrappergen -basetype=driver.Rows -exttypes=driver.RowsColumnTypeDatabaseTypeName;driver.RowsColumnTypeLength;driver.RowsColumnTypeNullable;driver.RowsColumnTypePrecisionScale;driver.RowsColumnTypeScanType;driver.RowsNextResultSet -extrafields=extra,interface{} -prefix=realDR -newfunc=newRows -imports=reflect
+//go:generate wrappergen -basetype=driver.Conn -exttypes=driver.ConnBeginTx;driver.ConnPrepareContext;driver.Execer;driver.ExecerContext;driver.NamedValueChecker;driver.Pinger;driver.Queryer;driver.QueryerContext;driver.SessionResetter -extrafields=extra,interface{} -prefix=realDC -newfuncname=newConn
+
+//go:generate wrappergen -basetype=driver.Stmt -exttypes=driver.ColumnConverter;driver.NamedValueChecker;driver.StmtExecContext;driver.StmtQueryContext -extrafields=extra,interface{} -prefix=realDS -newfuncname=newStmt
+
+//go:generate wrappergen -basetype=driver.Rows -exttypes=driver.RowsColumnTypeDatabaseTypeName;driver.RowsColumnTypeLength;driver.RowsColumnTypeNullable;driver.RowsColumnTypePrecisionScale;driver.RowsColumnTypeScanType;driver.RowsNextResultSet -extrafields=extra,interface{} -prefix=realDR -newfuncname=newRows
+
+//go:generate wrappergen -basetype=driver.Tx -prefix=realDT -newfuncname=newTx -extrafields extra,interface{}
+
+// driver.Driver functions for driver.Conn
+
+func realDDOpen(r driver.Driver, extra interface{}, name string) (driver.Conn, error) {
+	realConn, err := r.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return newConn(realConn, extra), nil
+}
+
+// driver.Driver functions for driver.DriverContext
+
+func realDDOpenConnector(r driver.DriverContext, extra interface{}, name string) (driver.Connector, error) {
+	realConnector, err := r.OpenConnector(name)
+	if err != nil {
+		return nil, err
+	}
+	return newConnector(realConnector, extra), nil
+}
 
 // driver.Conn functions for driver.Conn
 
-func realPrepare(r driver.Conn, extra interface{}, query string) (driver.Stmt, error) {
+func realDCPrepare(r driver.Conn, extra interface{}, query string) (driver.Stmt, error) {
 	stmt, err := r.Prepare(query)
 	if err != nil {
 		return nil, err
@@ -23,11 +49,11 @@ func realPrepare(r driver.Conn, extra interface{}, query string) (driver.Stmt, e
 	return newStmt(stmt, extra), nil
 }
 
-func realClose(r driver.Conn, extra interface{}) error {
+func realDCClose(r driver.Conn, extra interface{}) error {
 	return r.Close()
 }
 
-func realBegin(r driver.Conn, extra interface{}) (driver.Tx, error) {
+func realDCBegin(r driver.Conn, extra interface{}) (driver.Tx, error) {
 	realTx, err := r.Begin()
 	if err != nil {
 		return nil, err
@@ -37,7 +63,7 @@ func realBegin(r driver.Conn, extra interface{}) (driver.Tx, error) {
 
 // driver.Conn functions for driver.ConnBeginTx
 
-func realBeginTx(r driver.ConnBeginTx, extra interface{}, ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+func realDCBeginTx(r driver.ConnBeginTx, extra interface{}, ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	realTx, err := r.BeginTx(ctx, opts)
 	if err != nil {
 		return nil, err
@@ -47,7 +73,7 @@ func realBeginTx(r driver.ConnBeginTx, extra interface{}, ctx context.Context, o
 
 // driver.Conn functions for driver.ConnPrepareContext
 
-func realPrepareContext(r driver.ConnPrepareContext, extra interface{}, ctx context.Context, query string) (driver.Stmt, error) {
+func realDCPrepareContext(r driver.ConnPrepareContext, extra interface{}, ctx context.Context, query string) (driver.Stmt, error) {
 	realStmt, err := r.PrepareContext(ctx, query)
 	if err != nil {
 		return nil, err
@@ -57,31 +83,31 @@ func realPrepareContext(r driver.ConnPrepareContext, extra interface{}, ctx cont
 
 // driver.Conn functions for driver.Execer
 
-func realExec(r driver.Execer, extra interface{}, query string, args []driver.Value) (driver.Result, error) {
+func realDCExec(r driver.Execer, extra interface{}, query string, args []driver.Value) (driver.Result, error) {
 	return r.Exec(query, args)
 }
 
 // driver.Conn functions for driver.ExecerContext
 
-func realExecContext(r driver.ExecerContext, extra interface{}, ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+func realDCExecContext(r driver.ExecerContext, extra interface{}, ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	return r.ExecContext(ctx, query, args)
 }
 
 // driver.Conn functions for driver.NamedValueChecker
 
-func realCheckNamedValue(r driver.NamedValueChecker, extra interface{}, value *driver.NamedValue) error {
+func realDCCheckNamedValue(r driver.NamedValueChecker, extra interface{}, value *driver.NamedValue) error {
 	return r.CheckNamedValue(value)
 }
 
 // driver.Conn functions for driver.Pinger
 
-func realPing(r driver.Pinger, extra interface{}, ctx context.Context) error {
+func realDCPing(r driver.Pinger, extra interface{}, ctx context.Context) error {
 	return r.Ping(ctx)
 }
 
 // driver.Conn functions for driver.Queryer
 
-func realQuery(r driver.Queryer, extra interface{}, query string, args []driver.Value) (driver.Rows, error) {
+func realDCQuery(r driver.Queryer, extra interface{}, query string, args []driver.Value) (driver.Rows, error) {
 	realRows, err := r.Query(query, args)
 	if err != nil {
 		return nil, err
@@ -91,7 +117,7 @@ func realQuery(r driver.Queryer, extra interface{}, query string, args []driver.
 
 // driver.Conn functions for driver.QueryerContext
 
-func realQueryContext(r driver.QueryerContext, extra interface{}, ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+func realDCQueryContext(r driver.QueryerContext, extra interface{}, ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	realRows, err := r.QueryContext(ctx, query, args)
 	if err != nil {
 		return nil, err
@@ -101,7 +127,7 @@ func realQueryContext(r driver.QueryerContext, extra interface{}, ctx context.Co
 
 // driver.Conn functions for driver.SessionResetter
 
-func realResetSession(r driver.SessionResetter, extra interface{}, ctx context.Context) error {
+func realDCResetSession(r driver.SessionResetter, extra interface{}, ctx context.Context) error {
 	return r.ResetSession(ctx)
 }
 
@@ -209,26 +235,22 @@ func realDRNextResultSet(r driver.RowsNextResultSet, extra interface{}) error {
 	return r.NextResultSet()
 }
 
-// hand-written stuff for Tx
-
-type tx struct {
-	r     driver.Tx
-	extra interface{}
-}
-
-var _ driver.Tx = &tx{}
-
-func newTx(realTx driver.Tx, extra interface{}) driver.Tx {
-	return &tx{
-		r:     realTx,
-		extra: extra,
+func realDCCConnect(r driver.Connector, extra interface{}, ctx context.Context) (driver.Conn, error) {
+	realConn, err := r.Connect(ctx)
+	if err != nil {
+		return nil, err
 	}
+	return newConn(realConn, extra), nil
 }
 
-func (t *tx) Commit() error {
-	return t.r.Commit()
+func realDCCDriver(r driver.Connector, extra interface{}) driver.Driver {
+	return newDriver(r.Driver(), extra)
 }
 
-func (t *tx) Rollback() error {
-	return t.r.Rollback()
+func realDTCommit(r driver.Tx, extra interface{}) error {
+	return r.Commit()
+}
+
+func realDTRollback(r driver.Tx, extra interface{}) error {
+	return r.Rollback()
 }
