@@ -19,7 +19,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"go/ast"
 	"go/format"
+	"go/parser"
 	"go/types"
 	"io"
 	"io/ioutil"
@@ -405,19 +407,91 @@ func (rt *resolvedTypes) resolveTypes(pi *parsedInput) error {
 		rt.resolvedExtTypes = append(rt.resolvedExtTypes, resType)
 	}
 	for _, ef := range pi.extraFields {
-		if ef.atype.String() == "interface{}" {
-			// resolved extra field types are used only to
-			// get the imports, interface{} needs no
-			// imports, so let's just ignore it.
-			continue
-		}
-		resType, err := rt.resolveType(&cfg, pkgs[0], pi, ef.atype)
+		efTypeStr := ef.atype.String()
+		efTypes, err := parseTypeString(efTypeStr)
 		if err != nil {
-			return fmt.Errorf("failed to resolve extra field type %s: %w", ef.atype, err)
+			return fmt.Errorf("failed to parse extra field type %s, likely an invalid go expression: %w", efTypeStr, err)
 		}
-		rt.resolvedEfTypes = append(rt.resolvedEfTypes, resType)
+		for _, efType := range efTypes {
+			resType, err := rt.resolveType(&cfg, pkgs[0], pi, efType)
+			if err != nil {
+				return fmt.Errorf("failed to resolve a type %s from extra field type %s: %w", efType, efTypeStr, err)
+			}
+			rt.resolvedEfTypes = append(rt.resolvedEfTypes, resType)
+		}
 	}
 	return nil
+}
+
+func parseTypeString(typeStr string) ([]aType, error) {
+	expr, err := parser.ParseExpr(typeStr)
+	if err != nil {
+		return nil, err
+	}
+	return collectNamesFromAST(expr)
+}
+
+func collectNamesFromAST(a interface{}) ([]aType, error) {
+	if a == nil {
+		return nil, fmt.Errorf("nil ast node")
+	}
+	switch t := a.(type) {
+	case *ast.Ident:
+		return []aType{
+			{
+				pkgName: "",
+				name:    t.Name,
+			},
+		}, nil
+	case *ast.SelectorExpr:
+		xident, ok := t.X.(*ast.Ident)
+		if !ok || xident == nil || t.Sel == nil {
+			return nil, fmt.Errorf("can't parse ast selector expression")
+		}
+		return []aType{
+			{
+				pkgName: xident.Name,
+				name:    t.Sel.Name,
+			},
+		}, nil
+	case *ast.ArrayType:
+		return collectNamesFromAST(t.Elt)
+	case *ast.StarExpr:
+		return collectNamesFromAST(t.X)
+	case *ast.FuncType:
+		var types []aType
+		for _, field := range t.Params.List {
+			ptypes, err := collectNamesFromAST(field.Type)
+			if err != nil {
+				return nil, err
+			}
+			types = append(types, ptypes...)
+		}
+		if t.Results == nil {
+			return types, nil
+		}
+		for _, field := range t.Results.List {
+			rtypes, err := collectNamesFromAST(field.Type)
+			if err != nil {
+				return nil, err
+			}
+			types = append(types, rtypes...)
+		}
+		return types, nil
+	case *ast.MapType:
+		keyTypes, err := collectNamesFromAST(t.Key)
+		if err != nil {
+			return nil, err
+		}
+		valueTypes, err := collectNamesFromAST(t.Value)
+		if err != nil {
+			return nil, err
+		}
+		return append(keyTypes, valueTypes...), nil
+	case *ast.ChanType:
+		return collectNamesFromAST(t.Value)
+	}
+	return nil, nil
 }
 
 func (rt *resolvedTypes) resolveType(cfg *packages.Config, thisPkg *packages.Package, pi *parsedInput, typeToResolve aType) (resolvedType, error) {
@@ -427,9 +501,18 @@ func (rt *resolvedTypes) resolveType(cfg *packages.Config, thisPkg *packages.Pac
 		return nilrt, fmt.Errorf("failed to get package path for type %s: %w (means, the package of the type is not imported in this package nor mentioned in -imports)", typeToResolve, err)
 	}
 	if pkgPath == "" {
-		realType, err := getType(types.Universe, typeToResolve.name)
+		// no package name means one of the following:
+		// - type comes from this package
+		// - type is a builtin (error)
+		// - type comes from a package imported with a dot
+		//
+		// last case is currently not supported
+		realType, err := getType(thisPkg.Types.Scope(), typeToResolve.name)
 		if err != nil {
-			return nilrt, fmt.Errorf("failed to resolve the type %s in Universe: %w (means, we could not find the type in the actual package)", typeToResolve, err)
+			realType, err = getType(types.Universe, typeToResolve.name)
+		}
+		if err != nil {
+			return nilrt, fmt.Errorf("failed to resolve the type %s in this package (%s) and in Universe: %w (means, we could not find the type in the actual package)", typeToResolve, thisPkg.PkgPath, err)
 		}
 		return resolvedType{
 			at: typeToResolve,
@@ -574,11 +657,6 @@ func (ta *typeAnalysis) analyzeForExtraImportsTypesAndMethods(rt *resolvedTypes)
 		return err
 	}
 	for _, resType := range rt.resolvedExtTypes {
-		if err := ta.analyzeResolvedTypeForExtraImportsTypesAndMethods(resType); err != nil {
-			return err
-		}
-	}
-	for _, resType := range rt.resolvedEfTypes {
 		if err := ta.analyzeResolvedTypeForExtraImportsTypesAndMethods(resType); err != nil {
 			return err
 		}
