@@ -112,8 +112,9 @@ func strToAnImport(s string) (anImport, error) {
 }
 
 type extraField struct {
-	name  string
-	atype aType
+	name    string
+	typeStr string
+	expr    ast.Expr
 }
 
 func strToExtraField(s string) (extraField, error) {
@@ -124,13 +125,14 @@ func strToExtraField(s string) (extraField, error) {
 	if len(parts) != 2 {
 		return extraField{}, fmt.Errorf("expected a comma-separated name-type pair for an extra field, got something else (%s)", s)
 	}
-	at, err := strToAType(parts[1])
+	expr, err := parser.ParseExpr(parts[1])
 	if err != nil {
-		return extraField{}, fmt.Errorf("failed to get a type in extra field %s: %w", s, err)
+		return extraField{}, fmt.Errorf("failed to get an AST for extra field %s (likely invalid Go snippet in type part): %w", s, err)
 	}
 	return extraField{
-		name:  parts[0],
-		atype: at,
+		name:    parts[0],
+		typeStr: parts[1],
+		expr:    expr,
 	}, nil
 }
 
@@ -407,15 +409,14 @@ func (rt *resolvedTypes) resolveTypes(pi *parsedInput) error {
 		rt.resolvedExtTypes = append(rt.resolvedExtTypes, resType)
 	}
 	for _, ef := range pi.extraFields {
-		efTypeStr := ef.atype.String()
-		efTypes, err := parseTypeString(efTypeStr)
+		efTypes, err := collectNamesFromAST(ef.expr)
 		if err != nil {
-			return fmt.Errorf("failed to parse extra field type %s, likely an invalid go expression: %w", efTypeStr, err)
+			return fmt.Errorf("failed to collect type names from field type %s, likely an unsupported go type expression: %w", ef.typeStr, err)
 		}
 		for _, efType := range efTypes {
 			resType, err := rt.resolveType(&cfg, pkgs[0], pi, efType)
 			if err != nil {
-				return fmt.Errorf("failed to resolve a type %s from extra field type %s: %w", efType, efTypeStr, err)
+				return fmt.Errorf("failed to resolve a type %s from extra field type %s: %w", efType, ef.typeStr, err)
 			}
 			rt.resolvedEfTypes = append(rt.resolvedEfTypes, resType)
 		}
@@ -423,15 +424,7 @@ func (rt *resolvedTypes) resolveTypes(pi *parsedInput) error {
 	return nil
 }
 
-func parseTypeString(typeStr string) ([]aType, error) {
-	expr, err := parser.ParseExpr(typeStr)
-	if err != nil {
-		return nil, err
-	}
-	return collectNamesFromAST(expr)
-}
-
-func collectNamesFromAST(a interface{}) ([]aType, error) {
+func collectNamesFromAST(a ast.Expr) ([]aType, error) {
 	if a == nil {
 		return nil, fmt.Errorf("nil ast node")
 	}
@@ -980,7 +973,7 @@ func printNewFunc(w io.Writer, funcName, prefix string, rt *resolvedTypes, extra
 	// exclude the zero - it will be handled after the switch
 	fmt.Fprintf(w, "func %s(%s %s", funcName, varName, rt.resolvedBaseType.at)
 	for _, ef := range extraFields {
-		fmt.Fprintf(w, ", %s %s", ef.name, ef.atype)
+		fmt.Fprintf(w, ", %s %s", ef.name, ef.typeStr)
 	}
 	fmt.Fprintf(w, ") %s {\n", rt.resolvedBaseType.at)
 	nComb := NCombs(len(rt.resolvedExtTypes))
@@ -1154,7 +1147,7 @@ func printTypes(w io.Writer, rt *resolvedTypes, extraFields []extraField) {
 		}
 		fmt.Fprintf(w, "\t}\n\n\tt%s struct {\n\t\tr i%s\n", tbn, tbn)
 		for _, ef := range extraFields {
-			fmt.Fprintf(w, "\t\t%s %s", ef.name, ef.atype)
+			fmt.Fprintf(w, "\t\t%s %s", ef.name, ef.typeStr)
 		}
 		fmt.Fprintf(w, "\t}\n")
 		counter++
