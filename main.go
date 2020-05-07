@@ -414,10 +414,22 @@ func (rt *resolvedTypes) resolveTypes(pi *parsedInput) error {
 			return fmt.Errorf("failed to collect type names from field type %s, likely an unsupported go type expression: %w", ef.typeStr, err)
 		}
 		for _, efType := range efTypes {
-			resType, err := rt.resolveType(&cfg, pkgs[0], pi, efType)
+			pkg, realType, err := rt.resolveAnyType(&cfg, pkgs[0], pi, efType)
 			if err != nil {
 				return fmt.Errorf("failed to resolve a type %s from extra field type %s: %w", efType, ef.typeStr, err)
 			}
+			named, ok := realType.(*types.Named)
+			if !ok {
+				// all the efType are names in form of
+				// either pkg.typename or typename, so
+				// the realType can be either a named
+				// type or a basic type. If it's a
+				// basic type, then let's ignore it -
+				// there is nothing to import for it
+				// anyway.
+				continue
+			}
+			resType := wrapIntoResolvedType(efType, pkg, named)
 			rt.resolvedEfTypes = append(rt.resolvedEfTypes, resType)
 		}
 	}
@@ -489,9 +501,36 @@ func collectNamesFromAST(a ast.Expr) ([]aType, error) {
 
 func (rt *resolvedTypes) resolveType(cfg *packages.Config, thisPkg *packages.Package, pi *parsedInput, typeToResolve aType) (resolvedType, error) {
 	nilrt := resolvedType{}
+	pkg, realType, err := rt.resolveAnyType(cfg, thisPkg, pi, typeToResolve)
+	if err != nil {
+		return nilrt, err
+	}
+	named, ok := realType.(*types.Named)
+	if !ok {
+		return nilrt, fmt.Errorf("type %s is not a named type", typeToResolve)
+	}
+	return wrapIntoResolvedType(typeToResolve, pkg, named), nil
+}
+
+func wrapIntoResolvedType(typeToResolve aType, pkg *packages.Package, named *types.Named) resolvedType {
+	if pkg == nil {
+		return resolvedType{
+			at: typeToResolve,
+			rt: named,
+		}
+	}
+	return resolvedType{
+		at:          typeToResolve,
+		rt:          named,
+		origPkgName: pkg.Name,
+		pkgPath:     pkg.PkgPath,
+	}
+}
+
+func (rt *resolvedTypes) resolveAnyType(cfg *packages.Config, thisPkg *packages.Package, pi *parsedInput, typeToResolve aType) (*packages.Package, types.Type, error) {
 	pkgPath, err := getPkgPath(thisPkg, typeToResolve, pi.inFile, pi.imports)
 	if err != nil {
-		return nilrt, fmt.Errorf("failed to get package path for type %s: %w (means, the package of the type is not imported in this package nor mentioned in -imports)", typeToResolve, err)
+		return nil, nil, fmt.Errorf("failed to get package path for type %s: %w (means, the package of the type is not imported in this package nor mentioned in -imports)", typeToResolve, err)
 	}
 	if pkgPath == "" {
 		// no package name means one of the following:
@@ -505,27 +544,19 @@ func (rt *resolvedTypes) resolveType(cfg *packages.Config, thisPkg *packages.Pac
 			realType, err = getType(types.Universe, typeToResolve.name)
 		}
 		if err != nil {
-			return nilrt, fmt.Errorf("failed to resolve the type %s in this package (%s) and in Universe: %w (means, we could not find the type in the actual package)", typeToResolve, thisPkg.PkgPath, err)
+			return nil, nil, fmt.Errorf("failed to resolve the type %s in this package (%s) and in Universe: %w (means, we could not find the type in the actual package)", typeToResolve, thisPkg.PkgPath, err)
 		}
-		return resolvedType{
-			at: typeToResolve,
-			rt: realType,
-		}, nil
+		return nil, realType, nil
 	}
 	pkg, err := findPackage(cfg, thisPkg, pkgPath)
 	if err != nil {
-		return nilrt, fmt.Errorf("failed to find package %s for type %s: %w (means, it isn't imported in this package, nor the go tools loader could load it", pkgPath, typeToResolve, err)
+		return nil, nil, fmt.Errorf("failed to find package %s for type %s: %w (means, it isn't imported in this package, nor the go tools loader could load it", pkgPath, typeToResolve, err)
 	}
 	realType, err := getType(pkg.Types.Scope(), typeToResolve.name)
 	if err != nil {
-		return nilrt, fmt.Errorf("failed to resolve the type %s in pkg %s: %w (means, we could not find the type in the actual package)", typeToResolve, pkg.Name, err)
+		return nil, nil, fmt.Errorf("failed to resolve the type %s in pkg %s: %w (means, we could not find the type in the actual package)", typeToResolve, pkg.Name, err)
 	}
-	return resolvedType{
-		at:          typeToResolve,
-		rt:          realType,
-		origPkgName: pkg.Name,
-		pkgPath:     pkg.PkgPath,
-	}, nil
+	return pkg, realType, nil
 }
 
 type pkgPathAndName struct {
@@ -1225,14 +1256,10 @@ func findPackageNoLoad(fpkg *packages.Package, pkgPath string) *packages.Package
 	return nil
 }
 
-func getType(scope *types.Scope, name string) (*types.Named, error) {
+func getType(scope *types.Scope, name string) (types.Type, error) {
 	obj := scope.Lookup(name)
 	if obj != nil {
-		named, ok := obj.Type().(*types.Named)
-		if ok {
-			return named, nil
-		}
-		return nil, fmt.Errorf("type %s is not a named type", name)
+		return obj.Type(), nil
 	}
 	return nil, fmt.Errorf("no type %s", name)
 }
