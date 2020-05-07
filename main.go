@@ -1178,7 +1178,7 @@ func printTypes(w io.Writer, rt *resolvedTypes, extraFields []extraField) {
 		}
 		fmt.Fprintf(w, "\t}\n\n\tt%s struct {\n\t\tr i%s\n", tbn, tbn)
 		for _, ef := range extraFields {
-			fmt.Fprintf(w, "\t\t%s %s", ef.name, ef.typeStr)
+			fmt.Fprintf(w, "\t\t%s %s\n", ef.name, ef.typeStr)
 		}
 		fmt.Fprintf(w, "\t}\n")
 		counter++
